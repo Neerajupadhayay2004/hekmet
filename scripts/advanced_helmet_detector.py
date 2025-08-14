@@ -17,7 +17,7 @@ import time
 class AdvancedHelmetDetector:
     def __init__(self):
         self.model = None
-        self.confidence_threshold = 0.6
+        self.confidence_threshold = 0.4  # lowered threshold for better detection
         self.iou_threshold = 0.45
         self.detection_history = []
         self.setup_directories()
@@ -42,50 +42,55 @@ class AdvancedHelmetDetector:
                 print("✅ Pre-trained YOLOv8 model loaded!")
         except Exception as e:
             print(f"❌ Error loading model: {e}")
-            
+    
     def detect_helmet_in_image(self, image_path, save_result=True):
-        """Detect helmets in a single image with high accuracy"""
+        """Detect helmets in a single image with high accuracy from all angles"""
         try:
             # Read image
             image = cv2.imread(image_path)
             if image is None:
                 raise ValueError("Could not load image")
             
-            # Run detection
-            results = self.model(image, conf=self.confidence_threshold, iou=self.iou_threshold)
+            # Preprocess image for better detection
+            processed_images = self.preprocess_image_for_angles(image)
             
-            # Process results
-            detections = []
-            annotated_image = image.copy()
+            all_detections = []
+            best_annotated_image = image.copy()
             
-            for result in results:
-                boxes = result.boxes
-                if boxes is not None:
-                    for box in boxes:
-                        # Get coordinates and confidence
-                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                        confidence = box.conf[0].cpu().numpy()
-                        class_id = int(box.cls[0].cpu().numpy())
-                        
-                        # Classify as helmet or no-helmet based on detection
-                        is_helmet = self.classify_helmet_detection(image, x1, y1, x2, y2)
-                        
-                        detection = {
-                            'bbox': [int(x1), int(y1), int(x2), int(y2)],
-                            'confidence': float(confidence),
-                            'class': 'helmet' if is_helmet else 'no-helmet',
-                            'timestamp': datetime.now().isoformat()
-                        }
-                        detections.append(detection)
-                        
-                        # Draw bounding box
-                        color = (0, 255, 0) if is_helmet else (0, 0, 255)  # Green for helmet, Red for no-helmet
-                        cv2.rectangle(annotated_image, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                        
-                        # Add label
-                        label = f"{detection['class']}: {confidence:.2f}"
-                        cv2.putText(annotated_image, label, (int(x1), int(y1)-10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            # Process each angle/preprocessing variant
+            for processed_img in processed_images:
+                # Run detection
+                results = self.model(processed_img, conf=self.confidence_threshold, iou=self.iou_threshold)
+                
+                # Process results
+                for result in results:
+                    boxes = result.boxes
+                    if boxes is not None:
+                        for box in boxes:
+                            # Get coordinates and confidence
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            confidence = box.conf[0].cpu().numpy()
+                            class_id = int(box.cls[0].cpu().numpy())
+                            
+                            # Enhanced helmet classification
+                            helmet_score = self.enhanced_helmet_classification(processed_img, x1, y1, x2, y2)
+                            
+                            # Only add if helmet score is high enough
+                            if helmet_score > 0.3:
+                                detection = {
+                                    'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                    'confidence': float(confidence),
+                                    'helmet_score': float(helmet_score),
+                                    'class': 'helmet' if helmet_score > 0.6 else 'no-helmet',
+                                    'timestamp': datetime.now().isoformat()
+                                }
+                                all_detections.append(detection)
+            
+            # Remove duplicate detections using NMS
+            final_detections = self.apply_custom_nms(all_detections)
+            
+            # Annotate the original image with final detections
+            annotated_image = self.annotate_image(image, final_detections)
             
             # Save result if requested
             if save_result:
@@ -96,60 +101,105 @@ class AdvancedHelmetDetector:
             # Update detection history
             self.detection_history.append({
                 'image_path': image_path,
-                'detections': detections,
+                'detections': final_detections,
                 'timestamp': datetime.now().isoformat()
             })
             
-            return annotated_image, detections
+            return annotated_image, final_detections
             
         except Exception as e:
             print(f"❌ Error in detection: {e}")
             return None, []
     
-    def classify_helmet_detection(self, image, x1, y1, x2, y2):
-        """Advanced helmet classification using multiple features"""
+    def preprocess_image_for_angles(self, image):
+        """Preprocess image to handle detection from different angles"""
+        processed_images = [image]  # Original image
+        
+        # Add rotated versions for better angle detection
+        angles = [-15, -10, -5, 5, 10, 15]
+        for angle in angles:
+            rotated = self.rotate_image(image, angle)
+            processed_images.append(rotated)
+        
+        # Add brightness/contrast variations
+        bright_img = cv2.convertScaleAbs(image, alpha=1.2, beta=20)
+        dark_img = cv2.convertScaleAbs(image, alpha=0.8, beta=-20)
+        processed_images.extend([bright_img, dark_img])
+        
+        # Add histogram equalization for better contrast
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        lab[:,:,0] = cv2.equalizeHist(lab[:,:,0])
+        enhanced_img = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        processed_images.append(enhanced_img)
+        
+        return processed_images
+    
+    def rotate_image(self, image, angle):
+        """Rotate image by given angle"""
+        height, width = image.shape[:2]
+        center = (width // 2, height // 2)
+        
+        rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(image, rotation_matrix, (width, height))
+        
+        return rotated
+    
+    def enhanced_helmet_classification(self, image, x1, y1, x2, y2):
+        """Enhanced helmet classification using multiple advanced features"""
         # Extract region of interest
         roi = image[int(y1):int(y2), int(x1):int(x2)]
         
         if roi.size == 0:
-            return False
+            return 0.0
             
         # Convert to different color spaces for analysis
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         
-        # Feature 1: Color analysis (helmets often have distinct colors)
-        helmet_colors = self.analyze_helmet_colors(hsv_roi)
+        # Feature 1: Enhanced color analysis
+        color_score = self.analyze_helmet_colors_enhanced(hsv_roi)
         
-        # Feature 2: Shape analysis (helmets have rounded shapes)
-        shape_score = self.analyze_helmet_shape(gray_roi)
+        # Feature 2: Advanced shape analysis
+        shape_score = self.analyze_helmet_shape_enhanced(gray_roi)
         
-        # Feature 3: Texture analysis (helmets have smooth surfaces)
-        texture_score = self.analyze_helmet_texture(gray_roi)
+        # Feature 3: Texture analysis with multiple methods
+        texture_score = self.analyze_helmet_texture_enhanced(gray_roi)
         
-        # Feature 4: Position analysis (helmets are typically on top of head)
-        position_score = self.analyze_helmet_position(x1, y1, x2, y2, image.shape)
+        # Feature 4: Position and size analysis
+        position_score = self.analyze_helmet_position_enhanced(x1, y1, x2, y2, image.shape)
         
-        # Combine all features for final classification
-        final_score = (helmet_colors * 0.3 + shape_score * 0.3 + 
-                      texture_score * 0.2 + position_score * 0.2)
+        # Feature 5: Edge density analysis
+        edge_score = self.analyze_helmet_edges(gray_roi)
         
-        return final_score > 0.5
+        # Feature 6: Reflectivity analysis (helmets are often reflective)
+        reflectivity_score = self.analyze_helmet_reflectivity(roi)
+        
+        # Combine all features with optimized weights
+        final_score = (color_score * 0.25 + shape_score * 0.25 + 
+                      texture_score * 0.15 + position_score * 0.15 +
+                      edge_score * 0.1 + reflectivity_score * 0.1)
+        
+        return final_score
     
-    def analyze_helmet_colors(self, hsv_roi):
-        """Analyze colors typical of helmets"""
-        # Define helmet color ranges in HSV
+    def analyze_helmet_colors_enhanced(self, hsv_roi):
+        """Enhanced color analysis for helmet detection"""
+        # Extended helmet color ranges in HSV
         helmet_color_ranges = [
-            # White helmets
-            ([0, 0, 200], [180, 30, 255]),
-            # Yellow helmets
-            ([20, 100, 100], [30, 255, 255]),
-            # Red helmets
-            ([0, 100, 100], [10, 255, 255]),
-            # Blue helmets
-            ([100, 100, 100], [130, 255, 255]),
-            # Green helmets
-            ([40, 100, 100], [80, 255, 255])
+            # White/Light colors (most common for safety helmets)
+            ([0, 0, 180], [180, 40, 255]),
+            # Yellow (construction helmets)
+            ([15, 80, 80], [35, 255, 255]),
+            # Red (safety helmets)
+            ([0, 80, 80], [15, 255, 255]),
+            ([165, 80, 80], [180, 255, 255]),
+            # Blue (industrial helmets)
+            ([90, 80, 80], [130, 255, 255]),
+            # Green (safety helmets)
+            ([35, 80, 80], [85, 255, 255]),
+            # Orange (construction helmets)
+            ([5, 80, 80], [25, 255, 255]),
+            # Gray (industrial helmets)
+            ([0, 0, 50], [180, 40, 180])
         ]
         
         total_pixels = hsv_roi.shape[0] * hsv_roi.shape[1]
@@ -159,12 +209,20 @@ class AdvancedHelmetDetector:
             mask = cv2.inRange(hsv_roi, np.array(lower), np.array(upper))
             helmet_pixels += cv2.countNonZero(mask)
         
-        return min(helmet_pixels / total_pixels, 1.0)
+        color_ratio = min(helmet_pixels / total_pixels, 1.0)
+        
+        # Boost score for dominant helmet colors
+        if color_ratio > 0.6:
+            color_ratio *= 1.2
+        
+        return min(color_ratio, 1.0)
     
-    def analyze_helmet_shape(self, gray_roi):
-        """Analyze shape characteristics of helmets"""
-        # Apply edge detection
-        edges = cv2.Canny(gray_roi, 50, 150)
+    def analyze_helmet_shape_enhanced(self, gray_roi):
+        """Enhanced shape analysis for helmet detection"""
+        # Apply multiple edge detection methods
+        edges1 = cv2.Canny(gray_roi, 30, 100)
+        edges2 = cv2.Canny(gray_roi, 50, 150)
+        edges = cv2.bitwise_or(edges1, edges2)
         
         # Find contours
         contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -172,53 +230,257 @@ class AdvancedHelmetDetector:
         if not contours:
             return 0.0
         
-        # Get the largest contour
-        largest_contour = max(contours, key=cv2.contourArea)
+        # Analyze multiple contours, not just the largest
+        shape_scores = []
         
-        # Calculate roundness (helmet-like shape)
-        area = cv2.contourArea(largest_contour)
-        perimeter = cv2.arcLength(largest_contour, True)
-        
-        if perimeter == 0:
-            return 0.0
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < 100:  # Skip very small contours
+                continue
+                
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
             
-        roundness = 4 * np.pi * area / (perimeter * perimeter)
-        return min(roundness, 1.0)
+            # Calculate multiple shape metrics
+            roundness = 4 * np.pi * area / (perimeter * perimeter)
+            
+            # Calculate aspect ratio
+            x, y, w, h = cv2.boundingRect(contour)
+            aspect_ratio = w / h if h > 0 else 0
+            
+            # Helmets typically have aspect ratio between 0.8 and 1.5
+            aspect_score = 1.0 if 0.8 <= aspect_ratio <= 1.5 else 0.5
+            
+            # Calculate convexity (helmets are generally convex)
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            convexity = area / hull_area if hull_area > 0 else 0
+            
+            # Combine shape metrics
+            shape_score = (roundness * 0.4 + aspect_score * 0.3 + convexity * 0.3)
+            shape_scores.append(shape_score)
+        
+        return max(shape_scores) if shape_scores else 0.0
     
-    def analyze_helmet_texture(self, gray_roi):
-        """Analyze texture smoothness typical of helmets"""
-        # Calculate local binary pattern for texture analysis
+    def analyze_helmet_texture_enhanced(self, gray_roi):
+        """Enhanced texture analysis for helmet detection"""
         if gray_roi.size == 0:
             return 0.0
-            
-        # Calculate gradient magnitude
+        
+        # Multiple texture analysis methods
+        
+        # 1. Gradient-based texture analysis
         grad_x = cv2.Sobel(gray_roi, cv2.CV_64F, 1, 0, ksize=3)
         grad_y = cv2.Sobel(gray_roi, cv2.CV_64F, 0, 1, ksize=3)
         gradient_magnitude = np.sqrt(grad_x**2 + grad_y**2)
-        
-        # Smooth surfaces (like helmets) have lower gradient variance
         texture_variance = np.var(gradient_magnitude)
+        gradient_score = max(0, 1.0 - min(texture_variance / 1000, 1.0))
         
-        # Normalize and invert (lower variance = higher helmet probability)
-        normalized_variance = min(texture_variance / 1000, 1.0)
-        return 1.0 - normalized_variance
+        # 2. Local Binary Pattern analysis
+        lbp_score = self.calculate_lbp_uniformity(gray_roi)
+        
+        # 3. Smoothness analysis using Laplacian
+        laplacian = cv2.Laplacian(gray_roi, cv2.CV_64F)
+        smoothness = 1.0 - min(np.var(laplacian) / 10000, 1.0)
+        
+        # Combine texture scores
+        final_texture_score = (gradient_score * 0.4 + lbp_score * 0.3 + smoothness * 0.3)
+        
+        return final_texture_score
     
-    def analyze_helmet_position(self, x1, y1, x2, y2, image_shape):
-        """Analyze position typical of helmets (top of head)"""
+    def calculate_lbp_uniformity(self, gray_roi):
+        """Calculate Local Binary Pattern uniformity (helmets have uniform texture)"""
+        if gray_roi.shape[0] < 3 or gray_roi.shape[1] < 3:
+            return 0.0
+        
+        # Simple LBP calculation
+        lbp = np.zeros_like(gray_roi)
+        
+        for i in range(1, gray_roi.shape[0] - 1):
+            for j in range(1, gray_roi.shape[1] - 1):
+                center = gray_roi[i, j]
+                binary_string = ''
+                
+                # 8-neighborhood
+                neighbors = [
+                    gray_roi[i-1, j-1], gray_roi[i-1, j], gray_roi[i-1, j+1],
+                    gray_roi[i, j+1], gray_roi[i+1, j+1], gray_roi[i+1, j],
+                    gray_roi[i+1, j-1], gray_roi[i, j-1]
+                ]
+                
+                for neighbor in neighbors:
+                    binary_string += '1' if neighbor >= center else '0'
+                
+                lbp[i, j] = int(binary_string, 2)
+        
+        # Calculate uniformity (lower variance = more uniform = more helmet-like)
+        lbp_variance = np.var(lbp)
+        uniformity_score = max(0, 1.0 - min(lbp_variance / 10000, 1.0))
+        
+        return uniformity_score
+    
+    def analyze_helmet_position_enhanced(self, x1, y1, x2, y2, image_shape):
+        """Enhanced position analysis for helmet detection"""
         height, width = image_shape[:2]
         
-        # Calculate relative position
+        # Calculate relative position and size
+        center_x = (x1 + x2) / 2
         center_y = (y1 + y2) / 2
-        relative_y = center_y / height
+        bbox_width = x2 - x1
+        bbox_height = y2 - y1
         
-        # Helmets are typically in upper portion of detection
-        if relative_y < 0.4:  # Upper 40% of image
-            return 1.0
+        relative_x = center_x / width
+        relative_y = center_y / height
+        relative_size = (bbox_width * bbox_height) / (width * height)
+        
+        # Position scoring
+        position_score = 1.0
+        
+        # Helmets are typically in upper portion
+        if relative_y < 0.3:  # Upper 30%
+            position_score *= 1.2
         elif relative_y < 0.6:  # Middle portion
-            return 0.5
+            position_score *= 1.0
         else:  # Lower portion
-            return 0.1
+            position_score *= 0.6
+        
+        # Size scoring (helmets have reasonable size)
+        if 0.01 <= relative_size <= 0.3:  # Reasonable helmet size
+            position_score *= 1.1
+        elif relative_size > 0.5:  # Too large
+            position_score *= 0.5
+        elif relative_size < 0.005:  # Too small
+            position_score *= 0.3
+        
+        return min(position_score, 1.0)
     
+    def analyze_helmet_edges(self, gray_roi):
+        """Analyze edge characteristics typical of helmets"""
+        if gray_roi.size == 0:
+            return 0.0
+        
+        # Apply edge detection
+        edges = cv2.Canny(gray_roi, 50, 150)
+        
+        # Calculate edge density
+        edge_pixels = cv2.countNonZero(edges)
+        total_pixels = gray_roi.shape[0] * gray_roi.shape[1]
+        edge_density = edge_pixels / total_pixels
+        
+        # Helmets typically have moderate edge density (not too smooth, not too textured)
+        if 0.1 <= edge_density <= 0.4:
+            return 1.0
+        elif 0.05 <= edge_density <= 0.6:
+            return 0.7
+        else:
+            return 0.3
+    
+    def analyze_helmet_reflectivity(self, roi):
+        """Analyze reflectivity characteristics of helmets"""
+        if roi.size == 0:
+            return 0.0
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        
+        # Find bright spots (potential reflections)
+        _, bright_mask = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        bright_pixels = cv2.countNonZero(bright_mask)
+        total_pixels = gray.shape[0] * gray.shape[1]
+        
+        brightness_ratio = bright_pixels / total_pixels
+        
+        # Helmets often have some reflective areas but not too many
+        if 0.05 <= brightness_ratio <= 0.3:
+            return 1.0
+        elif 0.01 <= brightness_ratio <= 0.5:
+            return 0.7
+        else:
+            return 0.4
+    
+    def apply_custom_nms(self, detections, iou_threshold=0.5):
+        """Apply Non-Maximum Suppression to remove duplicate detections"""
+        if not detections:
+            return []
+        
+        # Sort by helmet_score (higher is better)
+        detections.sort(key=lambda x: x['helmet_score'], reverse=True)
+        
+        final_detections = []
+        
+        for detection in detections:
+            # Check if this detection overlaps significantly with any already selected
+            overlap = False
+            for final_det in final_detections:
+                iou = self.calculate_iou(detection['bbox'], final_det['bbox'])
+                if iou > iou_threshold:
+                    overlap = True
+                    break
+            
+            if not overlap:
+                final_detections.append(detection)
+        
+        return final_detections
+    
+    def calculate_iou(self, box1, box2):
+        """Calculate Intersection over Union of two bounding boxes"""
+        x1_1, y1_1, x2_1, y2_1 = box1
+        x1_2, y1_2, x2_2, y2_2 = box2
+        
+        # Calculate intersection
+        x1_i = max(x1_1, x1_2)
+        y1_i = max(y1_1, y1_2)
+        x2_i = min(x2_1, x2_2)
+        y2_i = min(y2_1, y2_2)
+        
+        if x2_i <= x1_i or y2_i <= y1_i:
+            return 0.0
+        
+        intersection = (x2_i - x1_i) * (y2_i - y1_i)
+        
+        # Calculate union
+        area1 = (x2_1 - x1_1) * (y2_1 - y1_1)
+        area2 = (x2_2 - x1_2) * (y2_2 - y1_2)
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
+    
+    def annotate_image(self, image, detections):
+        """Annotate image with enhanced detection results"""
+        annotated = image.copy()
+        
+        for detection in detections:
+            x1, y1, x2, y2 = detection['bbox']
+            helmet_score = detection['helmet_score']
+            is_helmet = detection['class'] == 'helmet'
+            
+            # Choose color based on detection
+            if is_helmet:
+                color = (0, 255, 0)  # Green for helmet
+                status = "HELMET"
+            else:
+                color = (0, 0, 255)  # Red for no helmet
+                status = "NO HELMET"
+            
+            # Draw bounding box with thickness based on confidence
+            thickness = max(2, int(helmet_score * 5))
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+            
+            # Add label with background
+            label = f"{status}: {helmet_score:.2f}"
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+            
+            # Draw label background
+            cv2.rectangle(annotated, (x1, y1 - label_size[1] - 10), 
+                         (x1 + label_size[0], y1), color, -1)
+            
+            # Draw label text
+            cv2.putText(annotated, label, (x1, y1 - 5), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return annotated
+
     def live_detection(self):
         """Real-time helmet detection from webcam"""
         cap = cv2.VideoCapture(0)
@@ -238,6 +500,7 @@ class AdvancedHelmetDetector:
             results = self.model(frame, conf=self.confidence_threshold, iou=self.iou_threshold)
             
             # Process and annotate frame
+            detections = []
             for result in results:
                 boxes = result.boxes
                 if boxes is not None:
@@ -245,20 +508,23 @@ class AdvancedHelmetDetector:
                         x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                         confidence = box.conf[0].cpu().numpy()
                         
-                        # Classify helmet
-                        is_helmet = self.classify_helmet_detection(frame, x1, y1, x2, y2)
+                        # Enhanced helmet classification
+                        helmet_score = self.enhanced_helmet_classification(frame, x1, y1, x2, y2)
                         
-                        # Draw bounding box
-                        color = (0, 255, 0) if is_helmet else (0, 0, 255)
-                        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
-                        
-                        # Add label
-                        label = f"{'Helmet' if is_helmet else 'No Helmet'}: {confidence:.2f}"
-                        cv2.putText(frame, label, (int(x1), int(y1)-10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        if helmet_score > 0.3:
+                            detection = {
+                                'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                'confidence': float(confidence),
+                                'helmet_score': float(helmet_score),
+                                'class': 'helmet' if helmet_score > 0.6 else 'no-helmet'
+                            }
+                            detections.append(detection)
+            
+            # Annotate frame
+            annotated_frame = self.annotate_image(frame, detections)
             
             # Display frame
-            cv2.imshow('Helmet Detection - Live', frame)
+            cv2.imshow('Helmet Detection - Live', annotated_frame)
             
             # Break on 'q' key press
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -348,7 +614,7 @@ class HelmetDetectorGUI:
         
         # Confidence threshold
         tk.Label(settings_frame, text="Confidence Threshold:").pack(side=tk.LEFT)
-        self.confidence_var = tk.DoubleVar(value=0.6)
+        self.confidence_var = tk.DoubleVar(value=0.4)
         confidence_scale = tk.Scale(settings_frame, from_=0.1, to=1.0, resolution=0.1,
                                   orient=tk.HORIZONTAL, variable=self.confidence_var,
                                   command=self.update_confidence)
@@ -455,8 +721,11 @@ class HelmetDetectorGUI:
         
         for i, detection in enumerate(detections, 1):
             status = "✅ HELMET" if detection['class'] == 'helmet' else "❌ NO HELMET"
+            helmet_score = detection['helmet_score']
             confidence = detection['confidence']
-            self.results_text.insert(tk.END, f"{i}. {status} (Confidence: {confidence:.2f})\n")
+            self.results_text.insert(tk.END, f"{i}. {status}\n")
+            self.results_text.insert(tk.END, f"   Helmet Score: {helmet_score:.3f}\n")
+            self.results_text.insert(tk.END, f"   Detection Confidence: {confidence:.3f}\n\n")
     
     def start_live_detection(self):
         """Start live detection in separate thread"""
@@ -491,3 +760,4 @@ if __name__ == "__main__":
     # Create GUI application
     app = HelmetDetectorGUI()
     app.run()
+</merged_code>
