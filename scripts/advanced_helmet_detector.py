@@ -760,4 +760,4 @@ if __name__ == "__main__":
     # Create GUI application
     app = HelmetDetectorGUI()
     app.run()
-</merged_code>
+
